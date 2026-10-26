@@ -1,0 +1,6 @@
+# Only the billing image is built from the repo root; send it what it copies.
+*
+!Directory.Build.props
+!src/Billing/
+src/Billing/bin/
+src/Billing/obj/
