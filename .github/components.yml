@@ -1,6 +1,7 @@
 # .github/components.yml - proof run for apps and containers with no Azure:
-# a TypeScript web app and a Python web app released as zips (`none`), and a
-# Python service whose image goes to ghcr.io (`container`, no ACR_NAME).
+# web apps in TypeScript, Python and C# released as zips (`none`), and a
+# Python and a C# service whose images go to ghcr.io (`container`, no
+# ACR_NAME).
 components:
   - name: web
     runtime: node
@@ -17,3 +18,20 @@ components:
     target: container
     path: src/worker
     dockerfile: src/worker/Dockerfile
+
+  - name: catalog
+    runtime: dotnet
+    target: none
+    project: src/Catalog/Catalog.csproj
+    test-project: tests/Catalog.Tests/Catalog.Tests.csproj
+    dotnet-version: '10.0.x'
+
+  # No `path`, so the image is built from the repo root; .dockerignore keeps
+  # that to what the Dockerfile copies.
+  - name: billing
+    runtime: dotnet
+    target: container
+    project: src/Billing/Billing.csproj
+    test-project: tests/Billing.Tests/Billing.Tests.csproj
+    dockerfile: src/Billing/Dockerfile
+    dotnet-version: '10.0.x'

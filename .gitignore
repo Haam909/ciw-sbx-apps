@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+src/**/bin/
+src/**/obj/
+tests/**/bin/
+tests/**/obj/
