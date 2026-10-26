@@ -1,0 +1,36 @@
+# .github/workflows/trigger-release.yml — calls reusable-release
+#
+# Marks a commit as a release: version, build, SBOM, signatures, tag, GitHub
+# Release. Deploys nothing; that is trigger-deploy.yml.
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      major:
+        description: 'Force a major version bump (breaking change)'
+        type: boolean
+        default: false
+      sha:
+        description: 'Commit to release (blank = the commit currently live in test)'
+        type: string
+        default: ''
+concurrency:
+  group: release
+  cancel-in-progress: false
+# The repo default token may be read-only. A called workflow can't raise
+# permissions, so grant what the reusable workflow asks for here.
+permissions:
+  contents: write          # the tag and the release
+  actions: read
+  pull-requests: read      # derive-version reads each merged PR's branch
+  deployments: read        # with sha blank, the newest test deployment
+  id-token: write          # keyless signing, attestation, Azure login for containers
+  attestations: write
+  packages: write          # install from a GitHub Packages Feed the repo's nuget.config or .npmrc names; push a container to ghcr.io
+jobs:
+  ci:
+    uses: Haam909/ci-workflows/.github/workflows/reusable-release.yml@v2
+    with:
+      major: ${{ inputs.major }}
+      sha: ${{ inputs.sha }}
+    secrets: inherit

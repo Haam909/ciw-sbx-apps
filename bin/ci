@@ -1,0 +1,505 @@
+#!/usr/bin/env bash
+# bin/ci — run this repo's checks on your own machine.
+#
+#   bin/ci                 the full gate: lint, typecheck, image, unit, integration
+#   bin/ci --quick        unit tests only — fast loop while coding, NOT a gate run
+#   bin/ci --tests         unit and integration tests, no lint or typecheck; what
+#                          CI runs on a merge to main
+#   bin/ci --install       install/restore dependencies first (slow; after a pull)
+#   bin/ci --only api      just one component
+#   bin/ci --fail-fast     stop at the first failure
+#
+# A plain `bin/ci` is what signoff attests to. The status carries no record of
+# which flags you used, so --quick is for iterating, never for signing off.
+#
+# Reads .github/components.yml, the same file the GitHub workflows read, so
+# what runs here is what runs there. Commands can be overridden per component
+# with a `commands:` block, and this script honours those too.
+#
+# Needs: bash, yq. Plus the toolchain for whatever your components use; gh
+# logged in with read:packages if a nuget.config or .npmrc names GitHub Packages;
+# az logged in if a nuget.config, .npmrc or requirements file names Azure Artifacts.
+
+set -uo pipefail
+
+MANIFEST="${CI_MANIFEST:-.github/components.yml}"
+QUICK=false; TESTS_ONLY=false; INSTALL=false; FAIL_FAST=false; ONLY=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --quick)      QUICK=true ;;
+    --tests)      TESTS_ONLY=true ;;
+    --install)    INSTALL=true ;;
+    --fail-fast|-f) FAIL_FAST=true ;;
+    --only)       ONLY="${2:-}"; shift ;;
+    -h|--help)    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+command -v yq > /dev/null || { echo "yq is required: brew install yq | winget install MikeFarah.yq" >&2; exit 2; }
+[[ -f "${MANIFEST}" ]] || { echo "no manifest at ${MANIFEST}" >&2; exit 2; }
+
+BOLD=$'\033[1m'; GREEN=$'\033[1;32m'; RED=$'\033[1;31m'; GREY=$'\033[1;90m'; OFF=$'\033[0m'
+RESULTS=(); FAILED=0; STARTED_ALL=$(date +%s)
+
+step() {                       # step <title> <command>
+  local title="$1" cmd="$2" started elapsed
+  printf '%s\n' "${GREY}── ${title}${OFF}"
+  started=$(date +%s)
+  if eval "${cmd}"; then
+    elapsed=$(( $(date +%s) - started ))
+    RESULTS+=("ok|${title}|${elapsed}")
+    printf '%s\n\n' "${GREEN}✓ ${title}${OFF} ${GREY}(${elapsed}s)${OFF}"
+  else
+    elapsed=$(( $(date +%s) - started ))
+    RESULTS+=("fail|${title}|${elapsed}")
+    FAILED=1
+    printf '%s\n\n' "${RED}✗ ${title}${OFF} ${GREY}(${elapsed}s)${OFF}"
+    [[ "${FAIL_FAST}" == true ]] && summary_and_exit
+  fi
+}
+
+summary_and_exit() {
+  local total=$(( $(date +%s) - STARTED_ALL ))
+  printf '%s\n' "${BOLD}Summary${OFF}"
+  for r in "${RESULTS[@]}"; do
+    IFS='|' read -r state title secs <<< "$r"
+    if [[ "$state" == ok ]]; then printf '  %s %s %s\n' "${GREEN}✓${OFF}" "$title" "${GREY}${secs}s${OFF}"
+    else printf '  %s %s %s\n' "${RED}✗${OFF}" "$title" "${GREY}${secs}s${OFF}"; fi
+  done
+  if [[ "${FAILED}" -eq 0 ]]; then
+    printf '%s\n' "${GREEN}All checks passed${OFF} ${GREY}(${total}s total)${OFF}"
+    exit 0
+  else
+    printf '%s\n' "${RED}Checks failed${OFF} ${GREY}(${total}s total)${OFF}"
+    exit 1
+  fi
+}
+
+# BEGIN feed-credentials
+# The same block is in local/bin/ci and actions/install-toolchain/action.yml;
+# change both. A component installs from whatever Feed the repo's own
+# nuget.config, .npmrc or requirements file names (ADR 0002). This only works
+# out which of those Feeds need a credential from us, chosen by the Feed's
+# host, and hands it to dotnet, npm and pip through the environment and
+# user-level files outside the work tree. Every other Feed is left to the
+# repo's own configuration.
+
+# pkg_domain <host>: GitHub Packages for a Host: pkg.github.com on github.com,
+# the Host itself on a <tenant>.ghe.com tenant (nuget.<tenant>.ghe.com,
+# npm.<tenant>.ghe.com). Empty for any other Host.
+pkg_domain() {
+  case "$1" in
+    github.com) echo pkg.github.com ;;
+    *.ghe.com)  echo "$1" ;;
+  esac
+}
+
+# feed_host <url>: the URL's host, lower case, without port.
+feed_host() {
+  local h="${1#*://}"
+  h="${h%%/*}"; h="${h##*@}"; h="${h%%:*}"
+  printf '%s\n' "${h}" | tr '[:upper:]' '[:lower:]'
+}
+
+# feed_kind <url> <pkg domain>: who supplies the Feed's credential. "github"
+# for GitHub Packages on this Host, "azure" for Azure Artifacts (the hosts
+# deliver-artifact publishes to with an Entra token); nothing for any other Feed.
+feed_kind() {
+  local host
+  host="$(feed_host "$1")"
+  if [[ -n "$2" && ( "${host}" == "nuget.$2" || "${host}" == "npm.$2" ) ]]; then
+    echo github
+  elif [[ "${host}" == pkgs.dev.azure.com || "${host}" == *.visualstudio.com ]]; then
+    echo azure
+  fi
+}
+
+# nuget_sources <dir> <repo root>: "<name><TAB><url>" for each <packageSources>
+# entry in the nuget.config files NuGet reads for a project in <dir>: that
+# folder's and every parent's, up to the repo root.
+nuget_sources() {
+  local d root f
+  root="$(cd "$2" 2> /dev/null && pwd)" || return 0
+  d="$(cd "$1" 2> /dev/null && pwd)" || return 0
+  while :; do
+    for f in "${d}"/[Nn][Uu][Gg][Ee][Tt].[Cc][Oo][Nn][Ff][Ii][Gg]; do
+      if [[ -f "${f}" ]]; then
+        yq -p xml -o tsv '.configuration.packageSources.add | ([] + .)[] | [.["+@key"], .["+@value"]]' "${f}" | tr -d '\r' || true
+      fi
+    done
+    if [[ "${d}" == "${root}" || "${d}" != "${root}"/* ]]; then break; fi
+    d="$(dirname "${d}")"
+  done
+}
+
+# npm_registries <package dir>: each registry URL (registry= and
+# @scope:registry=) in the package's own .npmrc. That is the only project
+# config npm reads; an .npmrc in a parent folder, the repo root's included,
+# is not read for a package below it.
+npm_registries() {
+  local f="$1/.npmrc"
+  if [[ -f "${f}" ]]; then
+    tr -d '\r' < "${f}" \
+      | sed -n -E 's/^[[:space:]]*(@[^:[:space:]]+:)?registry[[:space:]]*=[[:space:]]*([^[:space:]]+).*$/\2/p'
+  fi
+}
+
+# pip_indexes <dir>: each --index-url, -i and --extra-index-url line in the
+# component's requirements*.txt files. pip reads no config file from the work
+# tree, so those lines are where a repo names its index.
+pip_indexes() {
+  local f
+  for f in "$1"/requirements*.txt; do
+    if [[ -f "${f}" ]]; then
+      tr -d '\r' < "${f}" \
+        | sed -n -E 's/^[[:space:]]*(--index-url|--extra-index-url|-i)([[:space:]]*=[[:space:]]*|[[:space:]]+)([^[:space:]]+).*$/\3/p'
+    fi
+  done
+}
+
+# package_feeds <runtime> <pkg domain> <repo root> <component dir> [project...]
+# One line per GitHub Packages or Azure Artifacts Feed the component's package
+# config names, its kind (feed_kind) first:
+#   <kind><TAB>nuget<TAB><source name><TAB><url>
+#   <kind><TAB>npm<TAB><registry url>
+#   <kind><TAB>pip<TAB><index url>
+package_feeds() {
+  local runtime="$1" pkg="$2" root="$3" dir="$4" p name url kind
+  shift 4
+  case "${runtime}" in
+    dotnet)
+      [[ $# -gt 0 ]] || set -- .
+      for p in "$@"; do nuget_sources "${dir}/$(dirname "${p}")" "${root}"; done \
+        | sort -u | while IFS=$'\t' read -r name url; do
+            kind="$(feed_kind "${url}" "${pkg}")"
+            if [[ -n "${kind}" ]]; then printf '%s\tnuget\t%s\t%s\n' "${kind}" "${name}" "${url}"; fi
+          done ;;
+    node)
+      npm_registries "${dir}" | sort -u | while read -r url; do
+        kind="$(feed_kind "${url}" "${pkg}")"
+        if [[ -n "${kind}" ]]; then printf '%s\tnpm\t%s\n' "${kind}" "${url}"; fi
+      done ;;
+    python)
+      pip_indexes "${dir}" | sort -u | while read -r url; do
+        kind="$(feed_kind "${url}" "${pkg}")"
+        if [[ -n "${kind}" ]]; then printf '%s\tpip\t%s\n' "${kind}" "${url}"; fi
+      done ;;
+  esac
+}
+
+# feed_hosts <feeds>: the distinct hosts in package_feeds lines, comma-separated.
+feed_hosts() {
+  local line
+  while IFS= read -r line; do
+    if [[ -n "${line}" ]]; then feed_host "${line##*$'\t'}"; fi
+  done <<< "$1" | sort -u | paste -sd, - | sed 's/,/, /g'
+}
+
+# feed_credentials <kind> <token> <user> <npmrc> <netrc> <feeds>: adds to
+# CRED_ENV the environment that gives <token> to each Feed of <kind> in
+# <feeds> (package_feeds lines): NuGet's NuGetPackageSourceCredentials_<source
+# name>; for npm a user config at <npmrc> holding the current user config plus
+# the token; for pip a netrc at <netrc> holding the current one plus the token.
+feed_credentials() {
+  local want="$1" token="$2" user="$3" npmrc="$4" netrc="$5" label kind tool a b base reg
+  case "${want}" in
+    github) label="GitHub Packages" ;;
+    *)      label="Azure Artifacts" ;;
+  esac
+  while IFS=$'\t' read -r kind tool a b; do
+    [[ "${kind}" == "${want}" ]] || continue
+    case "${tool}" in
+      nuget)
+        CRED_ENV+=("NuGetPackageSourceCredentials_${a}=Username=${user};Password=${token}")
+        echo "Feed: ${label}, NuGet source '${a}' (${b})" ;;
+      npm)
+        if [[ ! -s "${npmrc}" ]]; then
+          base="${npm_config_userconfig:-${NPM_CONFIG_USERCONFIG:-${HOME}/.npmrc}}"
+          ( umask 077; { if [[ -f "${base}" ]]; then cat "${base}"; echo; fi; echo "# feed credentials"; } > "${npmrc}" )
+          if command -v cygpath > /dev/null; then base="$(cygpath -m "${npmrc}")"; else base="${npmrc}"; fi
+          CRED_ENV+=("npm_config_userconfig=${base}" "NPM_CONFIG_USERCONFIG=${base}")
+        fi
+        # npm keys a token by the registry URL minus its scheme, with a
+        # trailing slash. GitHub Packages serves tarballs from the host's
+        # root, Azure Artifacts from below the registry URL.
+        reg="${a#*:}"; reg="${reg%/}/"
+        printf '%s:_authToken=%s\n' "${reg}" "${token}" >> "${npmrc}"
+        if [[ "${kind}" == github && "${reg}" != "//$(feed_host "${a}")/" ]]; then
+          printf '%s:_authToken=%s\n' "//$(feed_host "${a}")/" "${token}" >> "${npmrc}"
+        fi
+        echo "Feed: ${label}, npm registry ${a}" ;;
+      pip)
+        # pip takes a host's credentials from a netrc when the index URL
+        # carries none. NETRC points it at this one, which starts as a copy
+        # of the user's own.
+        if [[ ! -s "${netrc}" ]]; then
+          base="${NETRC:-${HOME}/.netrc}"
+          if [[ -z "${NETRC:-}" && ! -f "${base}" ]]; then base="${HOME}/_netrc"; fi
+          ( umask 077; { if [[ -f "${base}" ]]; then cat "${base}"; echo; fi; echo "# feed credentials"; } > "${netrc}" )
+          if command -v cygpath > /dev/null; then base="$(cygpath -m "${netrc}")"; else base="${netrc}"; fi
+          CRED_ENV+=("NETRC=${base}")
+        fi
+        reg="$(printf 'machine %s login %s password %s' "$(feed_host "${a}")" "${user}" "${token}")"
+        if ! grep -qxF -- "${reg}" "${netrc}"; then printf '%s\n' "${reg}" >> "${netrc}"; fi
+        echo "Feed: ${label}, pip index ${a}" ;;
+    esac
+  done <<< "$6"
+}
+
+# with_feed_credentials <command>: runs the command with CRED_ENV in its
+# environment. A NuGet source name that isn't a shell identifier (a dot, a
+# dash) can only be passed through env(1).
+with_feed_credentials() {
+  local kv
+  local -a odd=()
+  (
+    for kv in ${CRED_ENV[@]+"${CRED_ENV[@]}"}; do
+      if [[ "${kv%%=*}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then export "${kv?}"; else odd+=("${kv}"); fi
+    done
+    if [[ ${#odd[@]} -gt 0 ]]; then exec env "${odd[@]}" bash -c "$1"; fi
+    eval "$1"
+  )
+}
+# END feed-credentials
+
+# A component whose nuget.config or .npmrc names GitHub Packages on this repo's
+# Host installs with the token of your gh login on that Host. The Host is read
+# from the origin remote. One whose nuget.config, .npmrc or requirements file
+# names Azure Artifacts installs with an Entra token from your az login. In
+# GitHub Actions, install-toolchain has already installed with the workflow's
+# credentials, so the restore below finds every package in the local cache and
+# needs none.
+# Relative, so it compares with the component folders whatever the path style.
+REPO_ROOT="$(git rev-parse --show-cdup 2> /dev/null)"; REPO_ROOT="${REPO_ROOT:-.}"
+GH_LOGIN_HOST="$(git remote get-url origin 2> /dev/null || true)"
+GH_LOGIN_HOST="${GH_LOGIN_HOST#*://}"; GH_LOGIN_HOST="${GH_LOGIN_HOST#*@}"; GH_LOGIN_HOST="${GH_LOGIN_HOST%%[:/]*}"
+GH_LOGIN_HOST="$(printf '%s' "${GH_LOGIN_HOST}" | tr '[:upper:]' '[:lower:]')"
+if [[ "${GH_LOGIN_HOST}" == ssh.github.com ]]; then GH_LOGIN_HOST=github.com; fi
+PKG="$(pkg_domain "${GH_LOGIN_HOST}")"
+if [[ "${GITHUB_ACTIONS:-}" == true ]]; then PKG=""; fi
+FEED_TOKEN=""; FEED_USER=""; AZ_TOKEN=""; CRED_FILES=()
+trap 'rm -f ${CRED_FILES[@]+"${CRED_FILES[@]}"}' EXIT
+
+# gh_feed_token <component> <feeds>: the gh token for GitHub Packages on the
+# Host, once per run. Exits when there is no login, or when the login's token
+# can't read packages.
+gh_feed_token() {
+  local feeds resp scopes
+  [[ -n "${FEED_TOKEN}" ]] && return 0
+  feeds="$(cut -f3- <<< "$2" | tr '\t' ' ' | sed 's/^/    /')"
+  if ! command -v gh > /dev/null || ! FEED_TOKEN="$(gh auth token --hostname "${GH_LOGIN_HOST}" 2> /dev/null)" || [[ -z "${FEED_TOKEN}" ]]; then
+    echo "${RED}✗ $1 installs from GitHub Packages on ${GH_LOGIN_HOST}, and gh has no login there.${OFF}" >&2
+    echo "${feeds}" >&2
+    echo "  Log in, then run bin/ci again:" >&2
+    echo "    ${GREY}gh auth login --hostname ${GH_LOGIN_HOST} --scopes read:packages${OFF}" >&2
+    exit 2
+  fi
+  # A classic or OAuth token lists its scopes; gh's default login has no
+  # read:packages, and the registry then refuses the install.
+  resp="$(gh api --hostname "${GH_LOGIN_HOST}" --include user 2> /dev/null | tr -d '\r' || true)"
+  scopes="$(sed -n 's/^[Xx]-[Oo][Aa]uth-[Ss]copes: *//p' <<< "${resp}")"
+  FEED_USER="$(sed -n 's/.*"login":"\([^"]*\)".*/\1/p' <<< "${resp}")"
+  if grep -qi '^x-oauth-scopes:' <<< "${resp}" && ! grep -qE '(^|[ ,])(read|write):packages' <<< "${scopes}"; then
+    echo "${RED}✗ $1 installs from GitHub Packages on ${GH_LOGIN_HOST}, and your gh token can't read packages (scopes: ${scopes}).${OFF}" >&2
+    echo "${feeds}" >&2
+    echo "  Add the scope, then run bin/ci again:" >&2
+    echo "    ${GREY}gh auth refresh --hostname ${GH_LOGIN_HOST} --scopes read:packages${OFF}" >&2
+    exit 2
+  fi
+  FEED_USER="${FEED_USER:-gh}"
+}
+
+# az_feed_token <component> <feeds>: an Entra token for Azure Artifacts from
+# your az login, once per run. 499b84ac-... is the Azure DevOps resource ID.
+# Exits when az is missing or has no login.
+az_feed_token() {
+  local feeds hosts
+  [[ -n "${AZ_TOKEN}" ]] && return 0
+  if ! command -v az > /dev/null \
+     || ! AZ_TOKEN="$(az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --query accessToken -o tsv 2> /dev/null | tr -d '\r')" \
+     || [[ -z "${AZ_TOKEN}" ]]; then
+    AZ_TOKEN=""
+    feeds="$(cut -f3- <<< "$2" | tr '\t' ' ' | sed 's/^/    /')"
+    hosts="$(feed_hosts "$2")"
+    if command -v az > /dev/null; then
+      echo "${RED}✗ $1 installs from Azure Artifacts on ${hosts}, and az has no login.${OFF}" >&2
+      echo "${feeds}" >&2
+    else
+      echo "${RED}✗ $1 installs from Azure Artifacts on ${hosts}, and az (the Azure CLI) is not installed.${OFF}" >&2
+      echo "${feeds}" >&2
+      echo "  Install it: https://learn.microsoft.com/cli/azure/install-azure-cli" >&2
+    fi
+    echo "  Log in, then run bin/ci again:" >&2
+    echo "    ${GREY}az login --allow-no-subscriptions${OFF}" >&2
+    exit 2
+  fi
+}
+
+# with_creds <command>: the command as step() should run it, with the Feed
+# credentials when this component has any, and unchanged when it has none.
+with_creds() {
+  if [[ ${#CRED_ENV[@]} -gt 0 ]]; then printf 'with_feed_credentials %q' "$1"; else printf '%s' "$1"; fi
+}
+
+if [[ "${QUICK}" == false ]] && grep -q 'integration' "${MANIFEST}"; then
+  # Podman serves the same API Testcontainers talks to, so either will do.
+  if ! { docker info || podman info; } > /dev/null 2>&1; then
+    echo "${RED}Neither Docker nor Podman is running.${OFF} Integration tests need one (Testcontainers)." >&2
+    echo "Start one, or run ${GREY}bin/ci --quick${OFF} to skip them — which is not enough to sign off." >&2
+    exit 2
+  fi
+fi
+
+# The full gate builds each container component's image the way CI's
+# build-artifact does, without the push, so a broken Dockerfile fails here
+# and not after the merge. CI runs --tests and builds the image itself.
+ENGINE=""
+if [[ "${QUICK}" == false && "${TESTS_ONLY}" == false ]] \
+   && [[ "$(ONLY="${ONLY}" yq '[.components[] | select(.target == "container" and (strenv(ONLY) == "" or .name == strenv(ONLY)))] | length' "${MANIFEST}")" -gt 0 ]]; then
+  if docker info > /dev/null 2>&1; then ENGINE=docker
+  elif podman info > /dev/null 2>&1; then ENGINE=podman
+  else
+    echo "${RED}Neither Docker nor Podman is running.${OFF} A container component's image is built by the gate." >&2
+    echo "Start one, or run ${GREY}bin/ci --quick${OFF} to skip it — which is not enough to sign off." >&2
+    exit 2
+  fi
+fi
+
+COUNT=$(yq '.components | length' "${MANIFEST}")
+for (( i=0; i<COUNT; i++ )); do
+  NAME=$(yq -r ".components[$i].name" "${MANIFEST}")
+  [[ -n "${ONLY}" && "${ONLY}" != "${NAME}" ]] && continue
+
+  RUNTIME=$(yq -r ".components[$i].runtime" "${MANIFEST}")
+  DIR=$(yq -r ".components[$i].path // \".\"" "${MANIFEST}")
+  PROJECT=$(yq -r ".components[$i].project // \"\"" "${MANIFEST}")
+  TESTPROJ=$(yq -r ".components[$i].\"test-project\" // \"\"" "${MANIFEST}")
+  C_INSTALL=$(yq -r ".components[$i].commands.install // \"\"" "${MANIFEST}")
+  C_LINT=$(yq -r ".components[$i].commands.lint // \"\"" "${MANIFEST}")
+  C_TYPE=$(yq -r ".components[$i].commands.typecheck // \"\"" "${MANIFEST}")
+  C_TEST=$(yq -r ".components[$i].commands.test // \"\"" "${MANIFEST}")
+  INTEGRATION=$(yq -r ".components[$i].\"integration-tests\" // \"\"" "${MANIFEST}")
+  C_ITEST=$(yq -r ".components[$i].commands.\"integration-test\" // \"\"" "${MANIFEST}")
+
+  # Every dotnet project CI restores, in locked mode (install-toolchain).
+  RESTORE=""
+  if [[ "${RUNTIME}" == dotnet ]]; then
+    for P in "${PROJECT}" "${TESTPROJ}" "${INTEGRATION}"; do
+      [[ -n "${P}" ]] && RESTORE+="${RESTORE:+ && }dotnet restore \"${P}\" --locked-mode"
+    done
+  fi
+
+  # Credentials for any GitHub Packages or Azure Artifacts Feed the install or
+  # the locked restore reads from. With no such Feed, CRED_ENV stays empty,
+  # neither gh nor az is called, and nothing changes.
+  CRED_ENV=()
+  if [[ "${INSTALL}" == true || -n "${RESTORE}" ]]; then
+    PROJECTS=()
+    for P in "${PROJECT}" "${TESTPROJ}" "${INTEGRATION}"; do
+      if [[ -n "${P}" ]]; then PROJECTS+=("${P}"); fi
+    done
+    FEEDS=""
+    if [[ "${GITHUB_ACTIONS:-}" != true ]]; then
+      FEEDS="$(package_feeds "${RUNTIME}" "${PKG}" "${REPO_ROOT}" "${DIR}" ${PROJECTS[@]+"${PROJECTS[@]}"})"
+    fi
+    if [[ -n "${FEEDS}" ]]; then
+      NPMRC="$(mktemp)"; NETRC_FILE="$(mktemp)"; CRED_FILES+=("${NPMRC}" "${NETRC_FILE}")
+      if grep -q '^github' <<< "${FEEDS}"; then
+        gh_feed_token "${NAME}" "$(grep '^github' <<< "${FEEDS}")"
+        feed_credentials github "${FEED_TOKEN}" "${FEED_USER}" "${NPMRC}" "${NETRC_FILE}" "${FEEDS}"
+      fi
+      if grep -q '^azure' <<< "${FEEDS}"; then
+        az_feed_token "${NAME}" "$(grep '^azure' <<< "${FEEDS}")"
+        feed_credentials azure "${AZ_TOKEN}" azure-artifacts "${NPMRC}" "${NETRC_FILE}" "${FEEDS}"
+      fi
+    fi
+  fi
+
+  if [[ "${INSTALL}" == true ]]; then
+    cmd="${C_INSTALL}"
+    if [[ -z "$cmd" ]]; then
+      case "${RUNTIME}" in
+        node)   cmd="npm ci" ;;
+        dotnet) cmd="${RESTORE}" ;;
+        # A package with only a pyproject.toml installs itself, editable, with
+        # its dev extra (pip warns and carries on if there is none).
+        python) cmd="if [ -f requirements.lock.txt ]; then python -m pip install --require-hashes -r requirements.lock.txt; elif [ -f requirements.txt ]; then python -m pip install -r requirements.txt; else python -m pip install -e '.[dev]'; fi" ;;
+      esac
+    fi
+    step "${NAME}: install" "(cd \"${DIR}\" && $(with_creds "${cmd}"))"
+  fi
+
+  # dotnet commands restore first unless told not to, and that restore is
+  # unlocked: it rewrites a stale packages.lock.json and passes, where CI's
+  # locked restore fails. So restore locked here and keep later steps off it.
+  if [[ "${RUNTIME}" == dotnet && "${INSTALL}" == false && -n "${RESTORE}" ]]; then
+    step "${NAME}: restore (locked)" "(cd \"${DIR}\" && $(with_creds "${RESTORE}"))"
+  fi
+
+  if [[ "${QUICK}" == false && "${TESTS_ONLY}" == false ]]; then
+    cmd="${C_LINT}"
+    if [[ -z "$cmd" ]]; then
+      case "${RUNTIME}" in
+        node)   cmd="npm run lint --if-present" ;;
+        dotnet) cmd="dotnet format \"${PROJECT}\" --verify-no-changes --no-restore" ;;
+        # As modules: pip often puts the scripts in a folder that isn't on PATH.
+        python) cmd="python -m ruff check . && python -m ruff format --check ." ;;
+      esac
+    fi
+    step "${NAME}: lint" "(cd \"${DIR}\" && ${cmd})"
+
+    cmd="${C_TYPE}"
+    if [[ -z "$cmd" ]]; then
+      case "${RUNTIME}" in
+        # if/else, not `a && b || echo`: with that shape a failing tsc or
+        # mypy falls through to the echo and the step passes.
+        node)   cmd="if [ -f tsconfig.json ]; then npx --no-install tsc --noEmit; else echo 'no tsconfig; skipped'; fi" ;;
+        dotnet) cmd="dotnet build \"${PROJECT}\" --no-restore -c Release -warnaserror" ;;
+        python) cmd="if python -m mypy --version > /dev/null 2>&1; then python -m mypy .; else echo 'mypy not installed; skipped'; fi" ;;
+      esac
+    fi
+    step "${NAME}: typecheck" "(cd \"${DIR}\" && ${cmd})"
+
+    # From the repo root, as in CI: dockerfile is relative to it, and the
+    # build context is the component's path.
+    if [[ "$(yq -r ".components[$i].target" "${MANIFEST}")" == container ]]; then
+      DOCKERFILE=$(yq -r ".components[$i].dockerfile // \"Dockerfile\"" "${MANIFEST}")
+      step "${NAME}: image" "${ENGINE} build --build-arg VERSION=0.0.0-local -f \"${DOCKERFILE}\" -t \"bin-ci/${NAME}:local\" \"${DIR}\""
+    fi
+  fi
+
+  # Unit tests. Integration tests follow below.
+  cmd="${C_TEST}"
+  if [[ -z "$cmd" ]]; then
+    case "${RUNTIME}" in
+      node)   cmd="CI=true npm test" ;;
+      python) cmd="python -m pytest -m 'not integration'" ;;
+      dotnet)
+        if [[ -z "${TESTPROJ}" ]]; then
+          echo "${GREY}── ${NAME}: no test-project declared, skipping${OFF}"; continue
+        fi
+        cmd="dotnet test \"${TESTPROJ}\" -c Release --no-restore --filter \"Category!=Integration\"" ;;
+    esac
+  fi
+  step "${NAME}: unit tests" "(cd \"${DIR}\" && ${cmd})"
+
+  # Integration tests run here too — they are the ones most likely to catch a
+  # real defect, so deferring them to a server defeats the point of the gate.
+  # Testcontainers starts its own databases against the local Docker daemon.
+  if [[ "${QUICK}" == false && ( -n "${INTEGRATION}" || -n "${C_ITEST}" ) ]]; then
+    cmd="${C_ITEST}"
+    if [[ -z "$cmd" ]]; then
+      case "${RUNTIME}" in
+        node)   cmd="npm run test:integration" ;;
+        python) cmd="python -m pytest -m integration" ;;
+        dotnet) cmd="dotnet test \"${INTEGRATION}\" -c Release --no-restore --filter \"Category=Integration\"" ;;
+      esac
+    fi
+    step "${NAME}: integration tests" "(cd \"${DIR}\" && ${cmd})"
+  fi
+done
+
+summary_and_exit

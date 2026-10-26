@@ -1,0 +1,13 @@
+{
+  "name": "ciw-sbx-apps-web",
+  "version": "0.0.0",
+  "private": true,
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/server.js",
+    "test": "tsc && node --test dist/*.test.js"
+  },
+  "dependencies": { "ms": "2.1.3" },
+  "devDependencies": { "@types/ms": "2.1.0", "@types/node": "22.20.4", "typescript": "7.0.2" }
+}

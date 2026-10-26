@@ -1,0 +1,23 @@
+# .github/workflows/trigger-merge-to-main.yml — calls reusable-deploy-to-test
+name: Merge to main
+on:
+  push:
+    branches: [main]
+concurrency:
+  group: main
+  cancel-in-progress: false
+# The repo default token may be read-only. A called workflow can't raise
+# permissions, so grant what the reusable workflow asks for here.
+permissions:
+  contents: read
+  pull-requests: read     # derive-version reads each merged PR's branch
+  id-token: write
+  deployments: write
+  packages: write
+jobs:
+  ci:
+    # A commit with this subject is the one that adds these triggers; it has
+    # nothing to deploy yet, so skip it however it was merged.
+    if: "!startsWith(github.event.head_commit.message, 'ci: onboard to ci-workflows')"
+    uses: Haam909/ci-workflows/.github/workflows/reusable-deploy-to-test.yml@v2
+    secrets: inherit

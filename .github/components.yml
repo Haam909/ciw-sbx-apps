@@ -1,0 +1,19 @@
+# .github/components.yml - proof run for apps and containers with no Azure:
+# a TypeScript web app and a Python web app released as zips (`none`), and a
+# Python service whose image goes to ghcr.io (`container`, no ACR_NAME).
+components:
+  - name: web
+    runtime: node
+    target: none
+    path: src/web
+
+  - name: api
+    runtime: python
+    target: none
+    path: src/api
+
+  - name: worker
+    runtime: python
+    target: container
+    path: src/worker
+    dockerfile: src/worker/Dockerfile
