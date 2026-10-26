@@ -21,3 +21,13 @@ pip install pytest==9.0.2 ruff==0.15.21
 (cd src/web && npm ci)
 git config core.hooksPath .githooks
 ```
+
+A released image is signed by digest with cosign, keyless, as the
+`reusable-release.yml` workflow at `v2`. To check one:
+
+```bash
+cosign verify \
+  --certificate-identity https://github.com/Haam909/ci-workflows/.github/workflows/reusable-release.yml@refs/tags/v2 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/haam909/ciw-sbx-apps/billing:0.3.0
+```
